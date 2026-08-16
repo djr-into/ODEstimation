@@ -2,7 +2,7 @@
 data/
 logs/
 cache/
-tools/
+tmp/
 
 # Python
 __pycache__/
