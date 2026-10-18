@@ -4,6 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
 from typing import List, Tuple
+from torch_geometric.data import Data
+import networkx as nx
+from torch_geometric.utils import to_networkx
 
 
 # ---------- 从广播后的节点平面恢复节点时序（固定 diag） ----------
@@ -167,6 +170,12 @@ class PathFormerGNN(nn.Module):
         dst = dst.to(device=device, dtype=torch.long)
         src, dst = self._sanitize_edges(src, dst, N)
         edge_index = torch.stack([src, dst], dim=0)  # [2,E]
+        
+        # data = Data(edge_index=edge_index, num_nodes=5)
+        # # 将PyG图转换为NetworkX图
+        # G = to_networkx(data, to_undirected=True)
+        # diameter = nx.diameter(G) 
+        # print(f"Graph diameter: {diameter}")
 
         # 每个时间步的边特征 [E,2]
         edge_attr_seq: List[torch.Tensor] = []
@@ -177,11 +186,49 @@ class PathFormerGNN(nn.Module):
 
         return x_seq, edge_index, edge_attr_seq  # [T,N,1], [2,E], list[T] of [E,2]
 
+    def _entropy_loss(self, alpha_PE: torch.Tensor) -> torch.Tensor:
+        """
+        alpha_PE: [P, E]，每条“软路径”在 E 条边上的注意力（已 softmax）
+        返回：标量（该样本的平均熵的负值，越尖锐越大）
+        """
+        eps = 1e-8
+        p = alpha_PE.clamp_min(eps)
+        ent = -(p * p.log()).sum(dim=-1).mean()  # 平均到 P
+        return ent  # 这是正的“熵”；外部乘 λ_ent 即可
+    
+    def _topo_smooth_loss(self, alpha_PE: torch.Tensor, src: torch.Tensor, dst: torch.Tensor, N: int) -> torch.Tensor:
+        """
+        对注意力做一次原图上的 E->N->E 平滑，并与原 alpha 做 L2 差，返回标量
+        """
+        P, E = alpha_PE.shape
+        # 统计每个节点的入/出度（用于平均）
+        deg_in  = torch.bincount(dst, minlength=N).clamp(min=1).to(alpha_PE.dtype)   # [N]
+        deg_out = torch.bincount(src, minlength=N).clamp(min=1).to(alpha_PE.dtype)   # [N]
+
+        # E->N：入/出边聚合
+        # (1) 入边：对每个 p，scatter_add 到 dst，然后 /deg_in
+        h_in = torch.zeros(P, N, dtype=alpha_PE.dtype, device=alpha_PE.device)
+        h_in.scatter_add_(dim=1, index=dst.unsqueeze(0).expand(P, -1), src=alpha_PE)   # [P,N]
+        h_in = h_in / deg_in.unsqueeze(0)                                              # [P,N]
+
+        # (2) 出边：scatter_add 到 src，然后 /deg_out
+        h_out = torch.zeros(P, N, dtype=alpha_PE.dtype, device=alpha_PE.device)
+        h_out.scatter_add_(dim=1, index=src.unsqueeze(0).expand(P, -1), src=alpha_PE)  # [P,N]
+        h_out = h_out / deg_out.unsqueeze(0)                                           # [P,N]
+
+        # N->E：回写到边（取 src 的 out 与 dst 的 in 的平均）
+        alpha_smooth = 0.5 * (h_out[:, src] + h_in[:, dst])   # [P,E]
+
+        # L2 差作为平滑损失
+        loss = ((alpha_PE - alpha_smooth) ** 2).mean()
+        return loss
+    
     def _forward_single(self, Xb: torch.Tensor):
         """
         单样本前向，返回 (y_b:[P], alpha_b:[P,E_b])
         输入数据归一化：对匹配流量、行程时间、节点流量分别做归一化
         """
+
         x_seq, edge_index, edge_attr_seq = self._dense_to_graph_single(Xb)
         src, dst = edge_index[0], edge_index[1]
         N = Xb.size(1)
@@ -200,7 +247,10 @@ class PathFormerGNN(nn.Module):
 
         # 软路径读出
         y_b, alpha_b = self.readout(z_EH, src, dst, N)         # [P], [P,E]
-        return y_b, alpha_b
+        # === 两个样本级正则 ===
+        ent_b = self._entropy_loss(alpha_b)                    # 标量：注意力熵
+        sm_b  = self._topo_smooth_loss(alpha_b, src, dst, N)   # 标量：拓扑平滑
+        return y_b, alpha_b, ent_b, sm_b
 
     def forward(self, X: torch.Tensor):
         """
@@ -211,14 +261,17 @@ class PathFormerGNN(nn.Module):
         """
         assert X.dim() == 5 and X.size(1) == 3, f"Expect [B,3,N,N,T], got {tuple(X.shape)}"
         B = X.size(0)
-        y_list = []
-        # alpha_list = []
+        y_list, alpha_list, ent_list, sm_list = [], [], [], []
         for b in range(B):
-            y_b, alpha_b = self._forward_single(X[b])
-            y_list.append(y_b.unsqueeze(0))   # [1,P]
-            # alpha_list.append(alpha_b)        # [P,E_b]
-        y = torch.cat(y_list, dim=0)          # [B,P]
-        return y
+            y_b, alpha_b, ent_b, sm_b = self._forward_single(X[b])
+            y_list.append(y_b.unsqueeze(0))    # [1,P]
+            alpha_list.append(alpha_b)         # [P,E_b]
+            ent_list.append(ent_b.unsqueeze(0))
+            sm_list.append(sm_b.unsqueeze(0))
+        y = torch.cat(y_list, dim=0)           # [B,P]
+        loss_ent = torch.cat(ent_list, dim=0).mean()   # 标量
+        loss_sm  = torch.cat(sm_list,  dim=0).mean()   # 标量
+        return y, alpha_list, loss_ent, loss_sm
 
 
 # ====== 最小前向自测 ======
@@ -241,6 +294,9 @@ if __name__ == "__main__":
     model = PathFormerGNN(hidden=64, tcn_layers=2, depth=3, P=200,
                           edge_threshold=0.0, keep_self_loops=False, debug_checks=True)
     print(model)
+    # 输出参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params}")
     y, alpha_list = model(X)
     print("y:", y.shape)  # [B,200]
     print("alpha[0]:", alpha_list[0].shape)  # [200, E_0]
